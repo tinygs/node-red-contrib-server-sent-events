@@ -70,6 +70,7 @@ function registerSubscriber(RED, node, msg) {
         event: 'connect',
         subscribers: node.subscribers.length,
         ip: msg.res._res.req.socket.remoteAddress,
+        'x-forwarded-for': msg.res._res.req.headers['x-forwarded-for'] || '',
     };
     node.send(msg);
 }
@@ -107,6 +108,7 @@ function unregisterSubscriber(node, msg) {
         event: 'disconnect',
         subscribers: node.subscribers.length,
         ip: msg.res._res.req.socket.remoteAddress,
+        'x-forwarded-for': msg.res._res.req.headers['x-forwarded-for'] || '',
     };
     node.send(msg);
 }
