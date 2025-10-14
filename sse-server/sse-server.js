@@ -171,15 +171,21 @@ function unregisterSubscriber(node, msg) {
  * @param {object} msg - The message object containing topic and payload.
  */
 function handleServerEvent(RED, node, msg) {
+	// Extract data immediately to avoid retaining msg reference
 	const event = `${node.event || msg.topic || 'message'}`;
 	const data = `${_serializeData(node.data || msg.payload)}`;
+	const messageId = msg._msgid;
+	
+	// Clear msg reference early to help GC
+	msg = null;
+	
 	RED.log.debug(`Sent event: ${event}`);
 	RED.log.debug(`Data: ${data}`);
 	node.subscribers = node.subscribers.filter((subscriber) => {
 		try {
 			subscriber.socket._res.write(`event: ${event}\n`);
 			subscriber.socket._res.write(`data: ${data}\n`);
-			subscriber.socket._res.write(`id: ${msg._msgid}\n\n`);
+			subscriber.socket._res.write(`id: ${messageId}\n\n`);
 			if (subscriber.socket._res.flush) subscriber.socket._res.flush();
 			return true;
 		} catch (e) {
