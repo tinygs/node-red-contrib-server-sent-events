@@ -50,7 +50,7 @@ function registerSubscriber(RED, node, msg) {
     // Store minimal references to avoid memory leaks
     const subscriberId = msg._msgid;
     const responseSocket = msg.res;
-    const clientIP = msg.res._res.req.socket.remoteAddress;
+    const clientIP = msg.req.headers["x-forwarded-for"] || msg.res._res.req.socket.remoteAddress;
 
     // Close a SSE connection when client disconnects
     const closeHandler = () => {
