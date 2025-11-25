@@ -51,9 +51,17 @@ function registerSubscriber(RED, node, msg) {
     const subscriberId = msg._msgid;
     const responseSocket = msg.res;
     const clientIP = msg.req.headers["x-forwarded-for"] || msg.res._res.req.socket.remoteAddress;
+    // Store socket reference for close event - use socket.on('close') instead of req.on('close')
+    // This is more reliable for detecting abrupt client disconnections
+    // See: https://github.com/nestjs/nest/issues/12670
+    const socket = msg.res._res.req.socket;
 
     // Close a SSE connection when client disconnects
     const closeHandler = () => {
+        // Prevent multiple calls
+        if (closeHandler._called) return;
+        closeHandler._called = true;
+        
         // Find and remove subscriber by ID to avoid keeping msg reference
         const subscriberIndex = node.subscribers.findIndex(sub => sub.id === subscriberId);
         if (subscriberIndex !== -1) {
@@ -83,10 +91,14 @@ function registerSubscriber(RED, node, msg) {
             });
         }
         updateNodeStatus(node, 'success');
-        // Remove the listener to avoid memory leaks
+        // Remove all listeners to avoid memory leaks
+        socket.removeListener('close', closeHandler);
         responseSocket._res.req.removeListener('close', closeHandler);
     };
     
+    // Listen on socket.on('close') - more reliable for abrupt disconnections
+    socket.on('close', closeHandler);
+    // Also listen on req.on('close') as a fallback
     responseSocket._res.req.on('close', closeHandler);
 
     // Prevent adding the same subscriber twice
@@ -94,6 +106,7 @@ function registerSubscriber(RED, node, msg) {
         node.subscribers.push({
             id: subscriberId,
             socket: responseSocket,
+            rawSocket: socket, // Store raw socket reference for cleanup
             closeHandler: closeHandler, // Store reference for manual cleanup
         });
     }
@@ -137,9 +150,12 @@ function unregisterSubscriber(node, msg) {
         RED.log.warn(`Error writing close event: ${e.message}`);
     }
 
-    // Clean up event listener to prevent memory leak
+    // Clean up event listeners to prevent memory leak
     if (subscriber.closeHandler) {
         try {
+            if (subscriber.rawSocket) {
+                subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
+            }
             subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
         } catch (e) {
             RED.log.warn(`Error removing close listener: ${e.message}`);
@@ -192,6 +208,17 @@ function handleServerEvent(RED, node, msg) {
 			RED.log.warn(
                 `Error sending event to subscriber ${subscriber.id}: ${e.message}`,
             );
+			// Clean up event listeners to prevent memory leak
+			if (subscriber.closeHandler) {
+				try {
+					if (subscriber.rawSocket) {
+						subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
+					}
+					subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
+				} catch (listenerErr) {
+					RED.log.warn(`Error removing close listener: ${listenerErr.message}`);
+				}
+			}
 			try {
 				subscriber.socket._res.end();
 			} catch (endErr) {
@@ -238,8 +265,11 @@ module.exports = function (RED) {
         this.on('close', (removed, done) => {
             this.subscribers.forEach((subscriber) => {
                 try {
-                    // Remove close listener first to prevent recursive calls
+                    // Remove close listeners first to prevent recursive calls
                     if (subscriber.closeHandler) {
+                        if (subscriber.rawSocket) {
+                            subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
+                        }
                         subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
                     }
                     
@@ -269,8 +299,11 @@ module.exports = function (RED) {
 			updateNodeStatus(this, 'success');
 			this.subscribers.forEach((subscriber) => {
 				try {
-					// Remove close listener first to prevent recursive calls
+					// Remove close listeners first to prevent recursive calls
 					if (subscriber.closeHandler) {
+						if (subscriber.rawSocket) {
+							subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
+						}
 						subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
 					}
 					

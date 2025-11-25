@@ -48,7 +48,7 @@ function handleEventSourceError(RED, node, config, err) {
     cleanupEventSource(node.eventSource);
     node.eventSource = null;
     setTimeout(
-      () => connect(RED, node, config),
+      () => connect(RED, node, config, false),
       falseError ? 50 : node.connectionAttemptInterval
     );
 //   } else {
@@ -74,8 +74,13 @@ function cleanupEventSource(eventSource) {
   if (eventSource.close) eventSource.close();
 }
 
-function connect(RED, node, config) {
-  RED.nodes.createNode(node, config);
+function connect(RED, node, config, isInitialConnect = false) {
+  // Only call createNode on initial connect, not on reconnections
+  if (isInitialConnect) {
+    RED.nodes.createNode(node, config);
+    // Register close event of the node runtime only once
+    node.on("close", () => handleEventSourceClose(RED, node, config));
+  }
 
   // Clean up previous instance if it exists
   if (node.eventSource) {
@@ -102,9 +107,6 @@ function connect(RED, node, config) {
   node.eventSource.on("error", (err) =>
     handleEventSourceError(RED, node, config, err)
   );
-
-  // Register close event of the node runtime to clean up old event sources
-  node.on("close", () => handleEventSourceClose(RED, node, config));
 
   RED.log.info(`Successfully connected to ${node.url}`);
 }
@@ -139,7 +141,7 @@ module.exports = function (RED) {
       this.connectionAttemptInterval = config.connectionAttemptInterval || 5000;
       //this.reconnectOnClose = config.reconnectOnClose === "true";
 
-      connect(RED, this, config);
+      connect(RED, this, config, true);
 
     //   const resetTimeout = this.connectionAttemptInterval;
         //this.maxConnectionAttempts * this.connectionAttemptInterval;
