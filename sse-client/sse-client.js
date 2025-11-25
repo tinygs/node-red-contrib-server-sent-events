@@ -45,7 +45,7 @@ function handleEventSourceError(RED, node, config, err) {
         node.error(errorMessage);
     }
 //   if (node._counter < node.maxConnectionAttempts) {
-    cleanupEventSource(node.eventSource);
+    cleanupEventSource(node.eventSource, RED);
     node.eventSource = null;
     setTimeout(
       () => connect(RED, node, config, false),
@@ -64,14 +64,42 @@ function handleEventSourceError(RED, node, config, err) {
 
 /**
  * Removes all listeners from the EventSource instance and closes it.
+ * Ensures the underlying socket is properly destroyed to notify the server.
  * @param {EventSource} eventSource
+ * @param {Object} RED - the Node-RED runtime object for logging
  */
-function cleanupEventSource(eventSource) {
+function cleanupEventSource(eventSource, RED) {
   if (!eventSource) return;
-  // Remove all known listeners
-  eventSource.removeAllListeners && eventSource.removeAllListeners();
-  // For compatibility with standard eventsource
-  if (eventSource.close) eventSource.close();
+  
+  try {
+    // Remove all known listeners first
+    if (eventSource.removeAllListeners) {
+      eventSource.removeAllListeners();
+    }
+    
+    // Try to abort the underlying request to force TCP close
+    // The eventsource library stores the request in _req
+    if (eventSource._req) {
+      if (eventSource._req.destroy) {
+        eventSource._req.destroy();
+      } else if (eventSource._req.abort) {
+        eventSource._req.abort();
+      }
+    }
+    
+    // Close the EventSource
+    if (eventSource.close) {
+      eventSource.close();
+    }
+    
+    if (RED) {
+      RED.log.debug('EventSource cleaned up and socket destroyed');
+    }
+  } catch (e) {
+    if (RED) {
+      RED.log.warn(`Error during EventSource cleanup: ${e.message}`);
+    }
+  }
 }
 
 function connect(RED, node, config, isInitialConnect = false) {
@@ -84,7 +112,7 @@ function connect(RED, node, config, isInitialConnect = false) {
 
   // Clean up previous instance if it exists
   if (node.eventSource) {
-    cleanupEventSource(node.eventSource);
+    cleanupEventSource(node.eventSource, RED);
     node.eventSource = null;
   }
 
@@ -120,7 +148,7 @@ function connect(RED, node, config, isInitialConnect = false) {
  */
 function handleEventSourceClose(RED, node, _config) {
   RED.log.debug(`Closing event source: ${node.url}`);
-  cleanupEventSource(node.eventSource);
+  cleanupEventSource(node.eventSource, RED);
     node.eventSource = null;
     node.status({});
 }

@@ -8,6 +8,35 @@ function _serializeData(data) {
 }
 
 /**
+ * Removes all event listeners from a subscriber to prevent memory leaks.
+ * @param {Object} subscriber - The subscriber object with handlers
+ * @param {Object} RED - The Node-RED runtime for logging
+ */
+function cleanupSubscriberListeners(subscriber, RED) {
+    if (!subscriber.handlers) return;
+    
+    try {
+        if (subscriber.rawSocket) {
+            subscriber.rawSocket.removeListener('close', subscriber.handlers.socketClose);
+            subscriber.rawSocket.removeListener('error', subscriber.handlers.socketError);
+            subscriber.rawSocket.removeListener('end', subscriber.handlers.socketEnd);
+        }
+        if (subscriber.rawReq) {
+            subscriber.rawReq.removeListener('close', subscriber.handlers.reqClose);
+            subscriber.rawReq.removeListener('aborted', subscriber.handlers.reqAborted);
+        }
+        if (subscriber.rawRes) {
+            subscriber.rawRes.removeListener('close', subscriber.handlers.resClose);
+            subscriber.rawRes.removeListener('finish', subscriber.handlers.resFinish);
+        }
+    } catch (e) {
+        if (RED) {
+            RED.log.warn(`Error removing listeners: ${e.message}`);
+        }
+    }
+}
+
+/**
  * Updates the status of a given node with a blue circle and the number of connected clients.
  *
  * @param {Object} node - The node to update status for.
@@ -51,55 +80,96 @@ function registerSubscriber(RED, node, msg) {
     const subscriberId = msg._msgid;
     const responseSocket = msg.res;
     const clientIP = msg.req.headers["x-forwarded-for"] || msg.res._res.req.socket.remoteAddress;
-    // Store socket reference for close event - use socket.on('close') instead of req.on('close')
-    // This is more reliable for detecting abrupt client disconnections
+    // Store references for close event detection
     // See: https://github.com/nestjs/nest/issues/12670
     const socket = msg.res._res.req.socket;
+    const res = msg.res._res;
+    const req = msg.res._res.req;
 
     // Close a SSE connection when client disconnects
-    const closeHandler = () => {
-        // Prevent multiple calls
-        if (closeHandler._called) return;
-        closeHandler._called = true;
-        
-        // Find and remove subscriber by ID to avoid keeping msg reference
-        const subscriberIndex = node.subscribers.findIndex(sub => sub.id === subscriberId);
-        if (subscriberIndex !== -1) {
-            const subscriber = node.subscribers[subscriberIndex];
-            // Clean up the connection
-            try {
-                subscriber.socket._res.write('event: close\n');
-                subscriber.socket._res.write(`data: The connection was closed by the client.\n`);
-                subscriber.socket._res.write(`id: ${subscriberId}\n\n`);
-                if (subscriber.socket._res.flush) subscriber.socket._res.flush();
-                subscriber.socket._res.end();
-            } catch (e) {
-                RED.log.warn(`Error writing close event: ${e.message}`);
+    const closeHandler = (source) => {
+        return () => {
+            RED.log.debug(`closeHandler called from: ${source} for subscriber ${subscriberId}`);
+            
+            // Prevent multiple calls
+            if (closeHandler._called) {
+                RED.log.debug(`closeHandler already called, skipping`);
+                return;
             }
+            closeHandler._called = true;
             
-            // Remove subscriber from array
-            node.subscribers.splice(subscriberIndex, 1);
-            
-            // Emit disconnect message
-            node.send({
-                _msgid: subscriberId,
-                payload: {
-                    event: 'disconnect',
-                    subscribers: node.subscribers.length,
-                    ip: clientIP,
+            // Find and remove subscriber by ID to avoid keeping msg reference
+            const subscriberIndex = node.subscribers.findIndex(sub => sub.id === subscriberId);
+            if (subscriberIndex !== -1) {
+                const subscriber = node.subscribers[subscriberIndex];
+                // Clean up the connection
+                try {
+                    subscriber.socket._res.write('event: close\n');
+                    subscriber.socket._res.write(`data: The connection was closed by the client.\n`);
+                    subscriber.socket._res.write(`id: ${subscriberId}\n\n`);
+                    if (subscriber.socket._res.flush) subscriber.socket._res.flush();
+                    subscriber.socket._res.end();
+                } catch (e) {
+                    RED.log.warn(`Error writing close event: ${e.message}`);
                 }
-            });
-        }
-        updateNodeStatus(node, 'success');
-        // Remove all listeners to avoid memory leaks
-        socket.removeListener('close', closeHandler);
-        responseSocket._res.req.removeListener('close', closeHandler);
+                
+                // Remove subscriber from array
+                node.subscribers.splice(subscriberIndex, 1);
+                
+                // Emit disconnect message (include ip directly since req won't be available)
+                node.send({
+                    _msgid: subscriberId,
+                    payload: {
+                        event: 'disconnect',
+                        subscribers: node.subscribers.length,
+                        ip: clientIP,
+                    },
+                    // Provide a minimal req-like object for compatibility with flows that check req.headers
+                    req: {
+                        headers: {
+                            'x-forwarded-for': clientIP
+                        }
+                    }
+                });
+            }
+            updateNodeStatus(node, 'success');
+            // Remove all listeners to avoid memory leaks
+            socket.removeListener('close', socketCloseHandler);
+            socket.removeListener('error', socketErrorHandler);
+            socket.removeListener('end', socketEndHandler);
+            req.removeListener('close', reqCloseHandler);
+            req.removeListener('aborted', reqAbortedHandler);
+            res.removeListener('close', resCloseHandler);
+            res.removeListener('finish', resFinishHandler);
+        };
     };
     
-    // Listen on socket.on('close') - more reliable for abrupt disconnections
-    socket.on('close', closeHandler);
-    // Also listen on req.on('close') as a fallback
-    responseSocket._res.req.on('close', closeHandler);
+    // Create named handlers for proper removal
+    const socketCloseHandler = closeHandler('socket.close');
+    const socketErrorHandler = closeHandler('socket.error');
+    const socketEndHandler = closeHandler('socket.end');
+    const reqCloseHandler = closeHandler('req.close');
+    const reqAbortedHandler = closeHandler('req.aborted');
+    const resCloseHandler = closeHandler('res.close');
+    const resFinishHandler = closeHandler('res.finish');
+    
+    // Listen on multiple events for maximum compatibility
+    // socket.on('close') - for abrupt disconnections at TCP level
+    socket.on('close', socketCloseHandler);
+    // socket.on('error') - for socket errors
+    socket.on('error', socketErrorHandler);
+    // socket.on('end') - when the other end signals FIN
+    socket.on('end', socketEndHandler);
+    // req.on('close') - standard HTTP request close
+    req.on('close', reqCloseHandler);
+    // req.on('aborted') - request was aborted by client (deprecated but still works)
+    req.on('aborted', reqAbortedHandler);
+    // res.on('close') - response stream closed (most reliable for SSE)
+    res.on('close', resCloseHandler);
+    // res.on('finish') - response finished writing
+    res.on('finish', resFinishHandler);
+    
+    RED.log.debug(`Registered close handlers for subscriber ${subscriberId}`);
 
     // Prevent adding the same subscriber twice
     if (!node.subscribers.some((sub) => sub.id === subscriberId)) {
@@ -107,7 +177,17 @@ function registerSubscriber(RED, node, msg) {
             id: subscriberId,
             socket: responseSocket,
             rawSocket: socket, // Store raw socket reference for cleanup
-            closeHandler: closeHandler, // Store reference for manual cleanup
+            rawRes: res, // Store raw response for cleanup
+            rawReq: req, // Store raw request for cleanup
+            handlers: { // Store all handlers for proper cleanup
+                socketClose: socketCloseHandler,
+                socketError: socketErrorHandler,
+                socketEnd: socketEndHandler,
+                reqClose: reqCloseHandler,
+                reqAborted: reqAbortedHandler,
+                resClose: resCloseHandler,
+                resFinish: resFinishHandler,
+            },
         });
     }
     updateNodeStatus(node, 'success');
@@ -129,56 +209,47 @@ function registerSubscriber(RED, node, msg) {
  * @param {Object} msg - The message object containing the id of the subscriber to remove and the response object to write to.
  * @return {void}
  */
-function unregisterSubscriber(node, msg) {
-    const subscriberId = msg._msgid;
-    const subscriberIndex = node.subscribers.findIndex(sub => sub.id === subscriberId);
+// function unregisterSubscriber(node, msg) {
+//     const subscriberId = msg._msgid;
+//     const subscriberIndex = node.subscribers.findIndex(sub => sub.id === subscriberId);
     
-    if (subscriberIndex === -1) {
-        RED.log.warn(`Subscriber ${subscriberId} not found for unregistration`);
-        return;
-    }
+//     if (subscriberIndex === -1) {
+//         RED.log.warn(`Subscriber ${subscriberId} not found for unregistration`);
+//         return;
+//     }
     
-    const subscriber = node.subscribers[subscriberIndex];
+//     const subscriber = node.subscribers[subscriberIndex];
     
-    // Write out closing message to client
-    try {
-        msg.res._res.write('event: close\n');
-        msg.res._res.write(`data: The connection was closed by the server.\n`);
-        msg.res._res.write(`id: ${subscriberId}\n\n`);
-        if (msg.res._res.flush) msg.res._res.flush();
-    } catch (e) {
-        RED.log.warn(`Error writing close event: ${e.message}`);
-    }
+//     // Write out closing message to client
+//     try {
+//         msg.res._res.write('event: close\n');
+//         msg.res._res.write(`data: The connection was closed by the server.\n`);
+//         msg.res._res.write(`id: ${subscriberId}\n\n`);
+//         if (msg.res._res.flush) msg.res._res.flush();
+//     } catch (e) {
+//         RED.log.warn(`Error writing close event: ${e.message}`);
+//     }
 
-    // Clean up event listeners to prevent memory leak
-    if (subscriber.closeHandler) {
-        try {
-            if (subscriber.rawSocket) {
-                subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
-            }
-            subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
-        } catch (e) {
-            RED.log.warn(`Error removing close listener: ${e.message}`);
-        }
-    }
+//     // Clean up event listeners to prevent memory leak
+//     cleanupSubscriberListeners(subscriber, RED);
 
-    // Remove the subscriber from the list
-    node.subscribers.splice(subscriberIndex, 1);
+//     // Remove the subscriber from the list
+//     node.subscribers.splice(subscriberIndex, 1);
     
-    try {
-        msg.res._res.end();
-    } catch (e) {
-        RED.log.warn(`Error closing response: ${e.message}`);
-    }
+//     try {
+//         msg.res._res.end();
+//     } catch (e) {
+//         RED.log.warn(`Error closing response: ${e.message}`);
+//     }
     
-    // Emit output message on client disconnect
-    msg.payload = {
-        event: 'disconnect',
-        subscribers: node.subscribers.length,
-        ip: msg.res._res.req.socket.remoteAddress,
-    };
-    node.send(msg);
-}
+//     // Emit output message on client disconnect
+//     msg.payload = {
+//         event: 'disconnect',
+//         subscribers: node.subscribers.length,
+//         ip: msg.res._res.req.socket.remoteAddress,
+//     };
+//     node.send(msg);
+// }
 
 /**
  * Sends server event data to all subscribers.
@@ -209,16 +280,7 @@ function handleServerEvent(RED, node, msg) {
                 `Error sending event to subscriber ${subscriber.id}: ${e.message}`,
             );
 			// Clean up event listeners to prevent memory leak
-			if (subscriber.closeHandler) {
-				try {
-					if (subscriber.rawSocket) {
-						subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
-					}
-					subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
-				} catch (listenerErr) {
-					RED.log.warn(`Error removing close listener: ${listenerErr.message}`);
-				}
-			}
+			cleanupSubscriberListeners(subscriber, RED);
 			try {
 				subscriber.socket._res.end();
 			} catch (endErr) {
@@ -266,12 +328,7 @@ module.exports = function (RED) {
             this.subscribers.forEach((subscriber) => {
                 try {
                     // Remove close listeners first to prevent recursive calls
-                    if (subscriber.closeHandler) {
-                        if (subscriber.rawSocket) {
-                            subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
-                        }
-                        subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
-                    }
+                    cleanupSubscriberListeners(subscriber, RED);
                     
                     subscriber.socket._res.write(`event: close\n`);
                     subscriber.socket._res.write(`data: Node closed\n`);
@@ -300,12 +357,7 @@ module.exports = function (RED) {
 			this.subscribers.forEach((subscriber) => {
 				try {
 					// Remove close listeners first to prevent recursive calls
-					if (subscriber.closeHandler) {
-						if (subscriber.rawSocket) {
-							subscriber.rawSocket.removeListener('close', subscriber.closeHandler);
-						}
-						subscriber.socket._res.req.removeListener('close', subscriber.closeHandler);
-					}
+					cleanupSubscriberListeners(subscriber, RED);
 					
 					subscriber.socket._res.write(`event: close\n`);
 					subscriber.socket._res.write(`data: Collection closed\n`);
