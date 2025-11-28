@@ -7,6 +7,27 @@ function _serializeData(data) {
 	return typeof data === 'string' ? data : JSON.stringify(data);
 }
 
+// Module-level debug switch: set environment variable `SSE_SERVER_DEBUG=1`
+// to force debug messages from this module to appear even when global
+// Node-RED log level is `info`. When enabled, messages are emitted with
+// `RED.log.info` so they are visible under the global `info` level.
+const MODULE_DEBUG = (process.env.SSE_SERVER_DEBUG === '1' || process.env.SSE_SERVER_DEBUG === 'true');
+
+function moduleDebug(RED, ...args) {
+    try {
+        const message = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+        if (MODULE_DEBUG) {
+            // Force visibility at 'info' level while keeping a clear prefix
+            RED.log.info(`[sse-server-debug] ${message}`);
+        } else {
+            // Preserve original debug behavior
+            RED.log.debug(message);
+        }
+    } catch {
+        // Avoid throwing from logging
+    }
+}
+
 /**
  * Removes all event listeners from a subscriber to prevent memory leaks.
  * @param {Object} subscriber - The subscriber object with handlers
@@ -60,7 +81,15 @@ function updateNodeStatus(node, type) {
  * @return {void}
  */
 function registerSubscriber(RED, node, msg) {
-    RED.log.debug('Client connected');
+    moduleDebug(RED, 'Client connected');
+    
+    // Check if this socket is already registered (avoid duplicates)
+    const incomingSocket = msg.res._res.req.socket;
+    const existingSubscriber = node.subscribers.find(sub => sub.rawSocket === incomingSocket);
+    if (existingSubscriber) {
+        moduleDebug(RED, `Socket already registered for subscriber ${existingSubscriber.id}, skipping registration`);
+    }
+    
     // Write the opening header
     msg.res._res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -89,11 +118,11 @@ function registerSubscriber(RED, node, msg) {
     // Close a SSE connection when client disconnects
     const closeHandler = (source) => {
         return () => {
-            RED.log.debug(`closeHandler called from: ${source} for subscriber ${subscriberId}`);
+            moduleDebug(RED, `closeHandler called from: ${source} for subscriber ${subscriberId}`);
             
             // Prevent multiple calls
             if (closeHandler._called) {
-                RED.log.debug(`closeHandler already called, skipping`);
+                moduleDebug(RED, `closeHandler already called, skipping`);
                 return;
             }
             closeHandler._called = true;
@@ -169,10 +198,10 @@ function registerSubscriber(RED, node, msg) {
     // res.on('finish') - response finished writing
     res.on('finish', resFinishHandler);
     
-    RED.log.debug(`Registered close handlers for subscriber ${subscriberId}`);
+    moduleDebug(RED, `Registered close handlers for subscriber ${subscriberId}`);
 
     // Prevent adding the same subscriber twice
-    if (!node.subscribers.some((sub) => sub.id === subscriberId)) {
+    if (!node.subscribers.some((sub) => sub.id === subscriberId) && ! existingSubscriber) {
         node.subscribers.push({
             id: subscriberId,
             socket: responseSocket,
@@ -266,14 +295,19 @@ function handleServerEvent(RED, node, msg) {
 	// Clear msg reference early to help GC
 	msg = null;
 	
-	RED.log.debug(`Sent event: ${event}`);
-	RED.log.debug(`Data: ${data}`);
+    moduleDebug(RED, `Sent event: ${event}`);
+    moduleDebug(RED, `Data: ${data}`);
+    // Debug: print number of subscribers before sending
+    moduleDebug(RED, `Subscribers before send: ${node.subscribers.length}`);
+	let subscriberIndex = 0;
 	node.subscribers = node.subscribers.filter((subscriber) => {
+		subscriberIndex++;
 		try {
 			subscriber.socket._res.write(`event: ${event}\n`);
 			subscriber.socket._res.write(`data: ${data}\n`);
 			subscriber.socket._res.write(`id: ${messageId}\n\n`);
 			if (subscriber.socket._res.flush) subscriber.socket._res.flush();
+            moduleDebug(RED, `Data sent to subscriber #${subscriberIndex} (id: ${subscriber.id})`);
 			return true;
 		} catch (e) {
 			RED.log.warn(
