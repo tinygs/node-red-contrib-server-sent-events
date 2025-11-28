@@ -296,7 +296,8 @@ function handleServerEvent(RED, node, msg) {
 	msg = null;
 	
     moduleDebug(RED, `Sent event: ${event}`);
-    moduleDebug(RED, `Data: ${data}`);
+    const dataPreview = data.length > 100 ? data.slice(0, 100) + '...' : data;
+    moduleDebug(RED, `Data: ${dataPreview}`);
     // Debug: print number of subscribers before sending
     moduleDebug(RED, `Subscribers before send: ${node.subscribers.length}`);
 	let subscriberIndex = 0;
